@@ -403,7 +403,7 @@ def map_user_row(row: dict) -> dict:
         "defaultTranslations": json.loads(translations) if translations else [],
         "denominationNotes": row.get("denomination_notes"),
         "relationshipSummary": row.get("relationship_summary"),
-        "onboardingCompleted": row.get("onboarding_completed") == 1,
+        "onboardingCompleted": str(row.get("onboarding_completed")) == "1",
         "createdAt": row.get("created_at"),
     }
 
