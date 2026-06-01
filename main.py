@@ -28,17 +28,20 @@ def get_db():
 
 def validate_apple_token(identity_token: str, expected_user_id: str) -> dict:
     """Validate Apple Identity Token. Raises on failure."""
-    signing_key = _apple_jwk_client.get_signing_key_from_jwt(identity_token)
-    payload = jwt.decode(
-        identity_token,
-        signing_key.key,
-        algorithms=["RS256"],
-        audience=APPLE_AUDIENCE,
-        issuer=APPLE_ISSUER,
-    )
-    if payload.get("sub") != expected_user_id:
-        raise ValueError("Token subject does not match user identifier")
-    return payload
+    try:
+        signing_key = _apple_jwk_client.get_signing_key_from_jwt(identity_token)
+        payload = jwt.decode(
+            identity_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=APPLE_AUDIENCE,
+            issuer=APPLE_ISSUER,
+        )
+        if payload.get("sub") != expected_user_id:
+            raise ValueError("Token subject does not match user identifier")
+        return payload
+    except Exception as e:
+        raise ValueError(f"Token validation failed: {e}")
 
 async def authenticate_request(authorization: str | None, x_apple_user_id: str | None) -> str:
     """Validate auth headers. Returns userId or raises HTTPException."""
