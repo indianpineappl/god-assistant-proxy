@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx, os, time, json, datetime
 from dotenv import load_dotenv
-import libsql_experimental as libsql
 import jwt
 from jwt import PyJWKClient
 
@@ -21,10 +20,47 @@ APPLE_ISSUER = "https://appleid.apple.com"
 APPLE_AUDIENCE = "Indic.Life-By-Bible"
 _apple_jwk_client = PyJWKClient(APPLE_JWKS_URL, cache_keys=True)
 
-def get_db():
-    """Get a Turso/libsql connection."""
-    conn = libsql.connect("life-by-bible", sync_url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
-    return conn
+# Turso HTTP API helper (no native deps needed)
+async def turso_execute(sql: str, args: list = None):
+    """Execute SQL via Turso's HTTP API. Returns rows as list of dicts."""
+    url = TURSO_DATABASE_URL.replace("libsql://", "https://")
+    headers = {"Authorization": f"Bearer {TURSO_AUTH_TOKEN}", "Content-Type": "application/json"}
+    
+    # Build request body for Turso HTTP API
+    stmt = {"type": "execute", "stmt": {"sql": sql}}
+    if args:
+        stmt["stmt"]["args"] = [{"type": "text", "value": str(a)} if a is not None else {"type": "null"} for a in args]
+    
+    body = {"requests": [stmt, {"type": "close"}]}
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(f"{url}/v2/pipeline", headers=headers, json=body)
+        if resp.status_code != 200:
+            print(f"[TURSO] Error: {resp.status_code} {resp.text[:200]}", flush=True)
+            raise Exception(f"Turso error: {resp.status_code}")
+        
+        data = resp.json()
+        result = data.get("results", [{}])[0]
+        
+        if "error" in result:
+            raise Exception(f"SQL error: {result['error']}")
+        
+        response = result.get("response", {}).get("result", {})
+        cols = [c["name"] for c in response.get("cols", [])]
+        rows_raw = response.get("rows", [])
+        
+        rows = []
+        for row in rows_raw:
+            row_dict = {}
+            for i, col in enumerate(cols):
+                cell = row[i]
+                row_dict[col] = cell.get("value") if cell.get("type") != "null" else None
+            rows.append(row_dict)
+        
+        return {
+            "rows": rows,
+            "rowsAffected": response.get("affected_row_count", 0),
+        }
 
 def validate_apple_token(identity_token: str, expected_user_id: str) -> dict:
     """Validate Apple Identity Token. Raises on failure."""
@@ -165,17 +201,13 @@ async def users_login(payload: dict):
         print(f"[LOGIN] Token validation failed: {e}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid identity token")
 
-    conn = get_db()
-    cursor = conn.execute("SELECT * FROM users WHERE apple_user_id = ?", [apple_user_id])
-    rows = cursor.fetchall()
-    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+    # Check if user exists
+    result = await turso_execute("SELECT * FROM users WHERE apple_user_id = ?", [apple_user_id])
 
-    if rows:
-        user = dict(zip(columns, rows[0]))
-        sub_cursor = conn.execute("SELECT * FROM subscriptions WHERE apple_user_id = ?", [apple_user_id])
-        sub_rows = sub_cursor.fetchall()
-        sub_cols = [desc[0] for desc in sub_cursor.description] if sub_cursor.description else []
-        sub = dict(zip(sub_cols, sub_rows[0])) if sub_rows else None
+    if result["rows"]:
+        user = result["rows"][0]
+        sub_result = await turso_execute("SELECT * FROM subscriptions WHERE apple_user_id = ?", [apple_user_id])
+        sub = sub_result["rows"][0] if sub_result["rows"] else None
 
         return {
             "isNewUser": False,
@@ -184,11 +216,10 @@ async def users_login(payload: dict):
         }
 
     # New user
-    conn.execute(
+    await turso_execute(
         "INSERT INTO users (apple_user_id, name, email) VALUES (?, ?, ?)",
         [apple_user_id, name, email],
     )
-    conn.commit()
     print(f"[LOGIN] New user: {apple_user_id[:10]}...", flush=True)
 
     return {"isNewUser": True, "profile": None, "subscription": None}
@@ -197,11 +228,10 @@ async def users_login(payload: dict):
 @app.post("/api/users/profile")
 async def users_profile(payload: dict, authorization: str | None = Header(default=None), x_apple_user_id: str | None = Header(default=None, alias="x-apple-user-id")):
     user_id = await authenticate_request(authorization, x_apple_user_id)
-    conn = get_db()
 
     # Verify user exists
-    cursor = conn.execute("SELECT apple_user_id FROM users WHERE apple_user_id = ?", [user_id])
-    if not cursor.fetchone():
+    check = await turso_execute("SELECT apple_user_id FROM users WHERE apple_user_id = ?", [user_id])
+    if not check["rows"]:
         raise HTTPException(status_code=404, detail="User not found. Call /api/users/login first.")
 
     # Build dynamic UPDATE
@@ -228,14 +258,14 @@ async def users_profile(payload: dict, authorization: str | None = Header(defaul
     if updates:
         updates.append("updated_at = datetime('now')")
         args.append(user_id)
-        conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE apple_user_id = ?", args)
+        await turso_execute(f"UPDATE users SET {', '.join(updates)} WHERE apple_user_id = ?", args)
 
     # Subscription sync
     if "subscription" in payload and payload["subscription"]:
         sub = payload["subscription"]
         product_id = sub.get("productId")
         if product_id:
-            conn.execute(
+            await turso_execute(
                 """INSERT INTO subscriptions (apple_user_id, product_id, status, updated_at)
                    VALUES (?, ?, 'active', datetime('now'))
                    ON CONFLICT(apple_user_id) DO UPDATE SET
@@ -245,41 +275,37 @@ async def users_profile(payload: dict, authorization: str | None = Header(defaul
                 [user_id, product_id],
             )
 
-    conn.commit()
     return {"updated": True}
 
 
 @app.get("/api/users/me")
 async def users_me(authorization: str | None = Header(default=None), x_apple_user_id: str | None = Header(default=None, alias="x-apple-user-id")):
     user_id = await authenticate_request(authorization, x_apple_user_id)
-    conn = get_db()
 
-    cursor = conn.execute("SELECT onboarding_completed FROM users WHERE apple_user_id = ?", [user_id])
-    row = cursor.fetchone()
-    if not row:
+    result = await turso_execute("SELECT onboarding_completed FROM users WHERE apple_user_id = ?", [user_id])
+    if not result["rows"]:
         raise HTTPException(status_code=404, detail="User not found")
 
-    sub_cursor = conn.execute("SELECT product_id, status, expires_at FROM subscriptions WHERE apple_user_id = ?", [user_id])
-    sub_row = sub_cursor.fetchone()
-    sub_cols = [desc[0] for desc in sub_cursor.description] if sub_cursor.description else []
+    user = result["rows"][0]
+    sub_result = await turso_execute("SELECT product_id, status, expires_at FROM subscriptions WHERE apple_user_id = ?", [user_id])
+    sub = sub_result["rows"][0] if sub_result["rows"] else None
 
     return {
         "exists": True,
-        "onboardingCompleted": row[0] == 1,
-        "subscription": dict(zip(sub_cols, sub_row)) if sub_row else None,
+        "onboardingCompleted": str(user.get("onboarding_completed")) == "1",
+        "subscription": {"productId": sub["product_id"], "status": sub["status"], "expiresAt": sub.get("expires_at")} if sub else None,
     }
 
 
 @app.delete("/api/users/account")
 async def users_delete_account(authorization: str | None = Header(default=None), x_apple_user_id: str | None = Header(default=None, alias="x-apple-user-id")):
     user_id = await authenticate_request(authorization, x_apple_user_id)
-    conn = get_db()
 
-    # CASCADE handles subscriptions
-    cursor = conn.execute("DELETE FROM users WHERE apple_user_id = ?", [user_id])
-    conn.commit()
+    # Delete subscriptions first (no CASCADE in HTTP API)
+    await turso_execute("DELETE FROM subscriptions WHERE apple_user_id = ?", [user_id])
+    result = await turso_execute("DELETE FROM users WHERE apple_user_id = ?", [user_id])
 
-    if cursor.rowcount == 0:
+    if result["rowsAffected"] == 0:
         raise HTTPException(status_code=404, detail="User not found")
 
     print(f"[ACCOUNT] Deleted: {user_id[:10]}...", flush=True)
@@ -356,12 +382,11 @@ def handle_notification(notification_type: str, original_txn_id: str | None, pro
     if not new_status or not original_txn_id:
         return
 
-    conn = get_db()
-    conn.execute(
+    import asyncio
+    asyncio.ensure_future(turso_execute(
         "UPDATE subscriptions SET status = ?, expires_at = ?, updated_at = datetime('now') WHERE original_transaction_id = ?",
         [new_status, expires_at, original_txn_id],
-    )
-    conn.commit()
+    ))
     print(f"[WEBHOOK] Updated txn={original_txn_id} → {new_status}", flush=True)
 
 
