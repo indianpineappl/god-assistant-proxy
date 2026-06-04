@@ -112,6 +112,187 @@ async def bible_key():
         raise HTTPException(status_code=500, detail="Server missing API_BIBLE_KEY")
     return {"key": API_BIBLE_KEY}
 
+
+# ─── Bible Text Cache Proxy ──────────────────────────────────────────────────
+
+# Translation code → API.Bible bibleId mapping (English translations)
+BIBLE_ID_MAP = {
+    "niv": "06125adad2d5898a-01",
+    "esv": "f421fe261da7624f-01",
+    "nlt": "65eec8e0b60e656b-01",
+    "nkjv": "de4e12af7f28f599-02",
+    "nasb": "5b23a9ce2f004971-01",
+    "csb": "a556c5305ee15c3f-01",
+    "nrsv": "1e8ab327edbce67f-01",
+    "ceb": "aab8aea595d6c498-01",
+    "msg": "65eec8e0b60e656b-01",
+}
+
+
+def normalize_reference(reference: str) -> str:
+    """Normalize reference to 'Book Chapter' format for consistent cache keys.
+    
+    Examples:
+        "John 3:16"          -> "John 3"
+        "john 3"             -> "John 3"
+        "1 Corinthians 13:4" -> "1 Corinthians 13"
+        "Genesis 1"          -> "Genesis 1"
+    """
+    ref = reference.strip()
+    # Remove verse portion (after colon)
+    if ":" in ref:
+        ref = ref[:ref.index(":")]
+    ref = ref.strip()
+    
+    # Split and capitalize properly
+    parts = ref.split()
+    if not parts:
+        return ref
+    
+    # Handle numbered books like "1 Corinthians", "2 Kings"
+    if parts[0].isdigit() and len(parts) >= 2:
+        parts[1] = parts[1].capitalize()
+        # Rest of parts (chapter number) stay as-is
+    else:
+        parts[0] = parts[0].capitalize()
+    
+    return " ".join(parts)
+
+
+async def resolve_bible_id(translation: str) -> str:
+    """Resolve translation code to API.Bible bibleId."""
+    code = translation.lower()
+    if code in BIBLE_ID_MAP:
+        return BIBLE_ID_MAP[code]
+    
+    # Fallback: try to find via API.Bible /bibles endpoint
+    headers = {"api-key": API_BIBLE_KEY}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get("https://api.scripture.api.bible/v1/bibles?language=eng", headers=headers)
+        if resp.status_code == 200:
+            bibles = resp.json().get("data", [])
+            for bible in bibles:
+                if bible.get("abbreviation", "").lower() == code:
+                    BIBLE_ID_MAP[code] = bible["id"]
+                    return bible["id"]
+    raise HTTPException(status_code=404, detail=f"Translation '{translation}' not found")
+
+
+def strip_html(text: str) -> str:
+    """Strip HTML tags from API.Bible content."""
+    import re
+    return re.sub(r'<[^>]+>', '', text).strip()
+
+
+async def fetch_from_api_bible(reference: str, translation: str) -> list:
+    """Fetch a chapter from API.Bible and return as verse list."""
+    bible_id = await resolve_bible_id(translation)
+    headers = {"api-key": API_BIBLE_KEY}
+    
+    url = f"https://api.scripture.api.bible/v1/bibles/{bible_id}/passages"
+    params = {"reference": reference}
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"Reference '{reference}' not found for translation '{translation}'")
+    if resp.status_code != 200:
+        print(f"[BIBLE_CACHE] API.Bible error: {resp.status_code} {resp.text[:200]}", flush=True)
+        raise HTTPException(status_code=502, detail=f"API.Bible returned {resp.status_code}")
+    
+    data = resp.json().get("data", {})
+    
+    # API.Bible can return verses in different formats
+    # Try to extract structured verse data
+    verses = []
+    
+    # Check if there are per-verse entries
+    verse_items = data.get("verses", [])
+    if verse_items:
+        for v in verse_items:
+            text = strip_html(v.get("content", "")).strip()
+            if not text:
+                continue
+            verses.append({
+                "book": v.get("bookName", ""),
+                "chapter": int(v.get("chapter", "0") if v.get("chapter") else "0"),
+                "verse": int(v.get("verse", "0") if v.get("verse") else "0"),
+                "text": text
+            })
+    else:
+        # Fallback: parse the content block
+        content = data.get("content", "")
+        if content:
+            text = strip_html(content).strip()
+            # Parse reference for metadata
+            parts = reference.split()
+            book = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+            chapter = int(parts[-1]) if parts[-1].isdigit() else 0
+            if text:
+                verses.append({
+                    "book": book,
+                    "chapter": chapter,
+                    "verse": 1,
+                    "text": text
+                })
+    
+    if not verses:
+        raise HTTPException(status_code=404, detail=f"No verses found for '{reference}' in '{translation}'")
+    
+    return verses
+
+
+@app.post("/api/bible/passage")
+async def bible_passage(payload: dict):
+    """Cache-through proxy: check Turso cache first, then API.Bible on miss.
+    No authentication required (Bible text is not user-specific).
+    """
+    reference = (payload.get("reference") or "").strip()
+    translation = (payload.get("translation") or "").strip().lower()
+    
+    if not reference:
+        raise HTTPException(status_code=400, detail="Missing 'reference' field")
+    if not translation:
+        raise HTTPException(status_code=400, detail="Missing 'translation' field")
+    
+    normalized_ref = normalize_reference(reference)
+    print(f"[BIBLE_CACHE] Request: translation={translation} reference='{reference}' normalized='{normalized_ref}'", flush=True)
+    
+    # Step 1: Check Turso cache
+    try:
+        result = await turso_execute(
+            "SELECT verses_json FROM bible_cache WHERE translation = ? AND reference = ?",
+            [translation, normalized_ref]
+        )
+        
+        if result["rows"]:
+            verses = json.loads(result["rows"][0]["verses_json"])
+            print(f"[BIBLE_CACHE] ✅ CACHE HIT: {translation}/{normalized_ref} ({len(verses)} verses)", flush=True)
+            return {"verses": verses, "translation": translation, "reference": normalized_ref, "cached": True}
+    except Exception as e:
+        print(f"[BIBLE_CACHE] ⚠️ Turso error (falling through to API.Bible): {e}", flush=True)
+    
+    # Step 2: Cache miss — fetch from API.Bible
+    print(f"[BIBLE_CACHE] ❌ CACHE MISS: {translation}/{normalized_ref} — fetching from API.Bible", flush=True)
+    
+    if not API_BIBLE_KEY:
+        raise HTTPException(status_code=500, detail="Server missing API_BIBLE_KEY")
+    
+    verses = await fetch_from_api_bible(normalized_ref, translation)
+    
+    # Step 3: Store in cache
+    try:
+        await turso_execute(
+            "INSERT OR IGNORE INTO bible_cache (translation, reference, verses_json) VALUES (?, ?, ?)",
+            [translation, normalized_ref, json.dumps(verses)]
+        )
+        print(f"[BIBLE_CACHE] 💾 Stored in cache: {translation}/{normalized_ref} ({len(verses)} verses)", flush=True)
+    except Exception as e:
+        print(f"[BIBLE_CACHE] ⚠️ Cache store failed (non-fatal): {e}", flush=True)
+    
+    return {"verses": verses, "translation": translation, "reference": normalized_ref, "cached": False}
+
 @app.post("/api/chat")
 @app.post("/v1/chat/completions")
 async def chat_completions(payload: dict):
