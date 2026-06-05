@@ -115,17 +115,26 @@ async def bible_key():
 
 # ─── Bible Text Cache Proxy ──────────────────────────────────────────────────
 
-# Translation code → API.Bible bibleId mapping (English translations)
-BIBLE_ID_MAP = {
-    "niv": "06125adad2d5898a-01",
-    "esv": "f421fe261da7624f-01",
-    "nlt": "65eec8e0b60e656b-01",
-    "nkjv": "de4e12af7f28f599-02",
-    "nasb": "5b23a9ce2f004971-01",
-    "csb": "a556c5305ee15c3f-01",
-    "nrsv": "1e8ab327edbce67f-01",
-    "ceb": "aab8aea595d6c498-01",
-    "msg": "65eec8e0b60e656b-01",
+import re as _re
+
+# Runtime cache for bibleId lookups (translation code → API.Bible bibleId)
+# Populated lazily from /bibles endpoint — survives across requests in same instance
+_bible_id_runtime_cache: dict = {}
+
+# Known aliases for common translation codes
+_TRANSLATION_ALIASES = {
+    "nrsv": ["nrsvue", "nrsv"],
+    "rsv": ["rsv"],
+    "nlt": ["nlt"],
+    "esv": ["esv"],
+    "niv": ["niv"],
+    "nasb": ["nasb", "nasb2020"],
+    "nkjv": ["nkjv"],
+    "ceb": ["ceb"],
+    "csb": ["csb", "hcsb"],
+    "msg": ["msg"],
+    "amp": ["amp"],
+    "web": ["web"],
 }
 
 
@@ -139,107 +148,157 @@ def normalize_reference(reference: str) -> str:
         "Genesis 1"          -> "Genesis 1"
     """
     ref = reference.strip()
-    # Remove verse portion (after colon)
     if ":" in ref:
         ref = ref[:ref.index(":")]
     ref = ref.strip()
-    
-    # Split and capitalize properly
     parts = ref.split()
     if not parts:
         return ref
-    
-    # Handle numbered books like "1 Corinthians", "2 Kings"
     if parts[0].isdigit() and len(parts) >= 2:
         parts[1] = parts[1].capitalize()
-        # Rest of parts (chapter number) stay as-is
     else:
         parts[0] = parts[0].capitalize()
-    
     return " ".join(parts)
-
-
-async def resolve_bible_id(translation: str) -> str:
-    """Resolve translation code to API.Bible bibleId."""
-    code = translation.lower()
-    if code in BIBLE_ID_MAP:
-        return BIBLE_ID_MAP[code]
-    
-    # Fallback: try to find via API.Bible /bibles endpoint
-    headers = {"api-key": API_BIBLE_KEY}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get("https://api.scripture.api.bible/v1/bibles?language=eng", headers=headers)
-        if resp.status_code == 200:
-            bibles = resp.json().get("data", [])
-            for bible in bibles:
-                if bible.get("abbreviation", "").lower() == code:
-                    BIBLE_ID_MAP[code] = bible["id"]
-                    return bible["id"]
-    raise HTTPException(status_code=404, detail=f"Translation '{translation}' not found")
 
 
 def strip_html(text: str) -> str:
     """Strip HTML tags from API.Bible content."""
-    import re
-    return re.sub(r'<[^>]+>', '', text).strip()
+    return _re.sub(r'<[^>]+>', '', text).strip()
+
+
+async def resolve_bible_id(translation: str) -> str:
+    """Resolve translation code to API.Bible bibleId by querying /bibles.
+    
+    Results are cached in-memory for the lifetime of the serverless instance.
+    """
+    code = translation.lower()
+    if code in _bible_id_runtime_cache:
+        return _bible_id_runtime_cache[code]
+    
+    print(f"[BIBLE_CACHE] Looking up bibleId for '{code}'", flush=True)
+    headers = {"api-key": API_BIBLE_KEY}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            "https://api.scripture.api.bible/v1/bibles",
+            headers=headers,
+            params={"language": "eng"}
+        )
+    
+    if resp.status_code != 200:
+        print(f"[BIBLE_CACHE] /bibles lookup failed: {resp.status_code}", flush=True)
+        raise HTTPException(status_code=502, detail="Could not list available Bibles")
+    
+    bibles = resp.json().get("data", [])
+    
+    # Log all available bibles on first call
+    avail = [(b.get("abbreviation","").lower(), b["id"]) for b in bibles]
+    print(f"[BIBLE_CACHE] Available bibles: {[(a,i[:8]) for a,i in avail[:20]]}", flush=True)
+    
+    # 1. Exact abbreviation match
+    for b in bibles:
+        if b.get("abbreviation", "").lower() == code:
+            _bible_id_runtime_cache[code] = b["id"]
+            print(f"[BIBLE_CACHE] Resolved '{code}' → {b['id']} (exact match)", flush=True)
+            return b["id"]
+    
+    # 2. Alias match
+    aliases = _TRANSLATION_ALIASES.get(code, [])
+    for alias in aliases:
+        for b in bibles:
+            if b.get("abbreviation", "").lower() == alias:
+                _bible_id_runtime_cache[code] = b["id"]
+                print(f"[BIBLE_CACHE] Resolved '{code}' → {b['id']} via alias '{alias}'", flush=True)
+                return b["id"]
+    
+    # 3. Name contains match
+    for b in bibles:
+        if code in b.get("name", "").lower():
+            _bible_id_runtime_cache[code] = b["id"]
+            print(f"[BIBLE_CACHE] Resolved '{code}' → {b['id']} (name match: {b['name']})", flush=True)
+            return b["id"]
+    
+    raise HTTPException(status_code=404, detail=f"Translation '{translation}' not available with this API key")
 
 
 async def fetch_from_api_bible(reference: str, translation: str) -> list:
-    """Fetch a chapter from API.Bible and return as verse list."""
+    """Fetch a chapter from API.Bible, parse verses, return list of dicts."""
     bible_id = await resolve_bible_id(translation)
-    headers = {"api-key": API_BIBLE_KEY}
-    
-    url = f"https://api.scripture.api.bible/v1/bibles/{bible_id}/passages"
-    params = {"reference": reference}
+    print(f"[BIBLE_CACHE] Fetching from API.Bible: {translation}/{reference} (bibleId={bible_id[:8]}...)", flush=True)
     
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=headers, params=params)
-        
+        resp = await client.get(
+            f"https://api.scripture.api.bible/v1/bibles/{bible_id}/passages",
+            headers={"api-key": API_BIBLE_KEY},
+            params={"reference": reference, "content-type": "text", "include-verse-numbers": "true"}
+        )
+    
+    if resp.status_code == 403:
+        # ID might be wrong — clear cache and retry after re-lookup next call
+        _bible_id_runtime_cache.pop(translation.lower(), None)
+        print(f"[BIBLE_CACHE] 403 for bibleId={bible_id} — cleared from cache", flush=True)
+        raise HTTPException(status_code=403, detail=f"API.Bible denied access to '{translation}'")
     if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail=f"Reference '{reference}' not found for translation '{translation}'")
+        raise HTTPException(status_code=404, detail=f"Reference '{reference}' not found for '{translation}'")
     if resp.status_code != 200:
-        print(f"[BIBLE_CACHE] API.Bible error: {resp.status_code} {resp.text[:200]}", flush=True)
+        print(f"[BIBLE_CACHE] API.Bible error: {resp.status_code} {resp.text[:300]}", flush=True)
         raise HTTPException(status_code=502, detail=f"API.Bible returned {resp.status_code}")
     
     data = resp.json().get("data", {})
-    
-    # API.Bible can return verses in different formats
-    # Try to extract structured verse data
     verses = []
     
-    # Check if there are per-verse entries
-    verse_items = data.get("verses", [])
-    if verse_items:
-        for v in verse_items:
+    # Parse verse numbers from text content (format: "[1] In the beginning...")
+    content = data.get("content", "")
+    if content:
+        text_clean = strip_html(content)
+        # Split by verse number markers like [1], [2], etc.
+        verse_parts = _re.split(r'\[(\d+)\]', text_clean)
+        # verse_parts alternates: [pre_text, verse_num, verse_text, verse_num, verse_text, ...]
+        
+        # Parse chapter from reference ("John 3" → chapter=3)
+        ref_parts = reference.split()
+        try:
+            chapter_num = int(ref_parts[-1])
+            book_name = " ".join(ref_parts[:-1])
+        except (ValueError, IndexError):
+            chapter_num = 0
+            book_name = reference
+        
+        i = 1  # skip index 0 (pre-verse text)
+        while i < len(verse_parts) - 1:
+            try:
+                v_num = int(verse_parts[i])
+                v_text = verse_parts[i + 1].strip()
+                if v_text:
+                    verses.append({
+                        "book": book_name,
+                        "chapter": chapter_num,
+                        "verse": v_num,
+                        "text": v_text
+                    })
+            except (ValueError, IndexError):
+                pass
+            i += 2
+    
+    # Fallback: use the verses array if available
+    if not verses:
+        for v in data.get("verses", []):
             text = strip_html(v.get("content", "")).strip()
-            if not text:
-                continue
-            verses.append({
-                "book": v.get("bookName", ""),
-                "chapter": int(v.get("chapter", "0") if v.get("chapter") else "0"),
-                "verse": int(v.get("verse", "0") if v.get("verse") else "0"),
-                "text": text
-            })
-    else:
-        # Fallback: parse the content block
-        content = data.get("content", "")
-        if content:
-            text = strip_html(content).strip()
-            # Parse reference for metadata
-            parts = reference.split()
-            book = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
-            chapter = int(parts[-1]) if parts[-1].isdigit() else 0
             if text:
-                verses.append({
-                    "book": book,
-                    "chapter": chapter,
-                    "verse": 1,
-                    "text": text
-                })
+                try:
+                    verses.append({
+                        "book": v.get("bookName", ""),
+                        "chapter": int(v.get("chapterId", "0").split(".")[-1] if "." in str(v.get("chapterId","")) else v.get("chapter", 0)),
+                        "verse": int(v.get("verseId", "0").split(".")[-1] if "." in str(v.get("verseId","")) else v.get("verse", 0)),
+                        "text": text
+                    })
+                except (ValueError, TypeError):
+                    pass
     
     if not verses:
+        print(f"[BIBLE_CACHE] No verses parsed for {translation}/{reference}. Raw content: {content[:200]}", flush=True)
         raise HTTPException(status_code=404, detail=f"No verses found for '{reference}' in '{translation}'")
     
+    print(f"[BIBLE_CACHE] Fetched {len(verses)} verses from API.Bible", flush=True)
     return verses
 
 
