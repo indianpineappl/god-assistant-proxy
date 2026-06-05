@@ -117,19 +117,38 @@ async def bible_key():
 
 import re as _re
 
-# Confirmed bibleIds for this API key (public-domain translations only)
-# Source: GET /v1/bibles?language=eng
+# All bibleIds available with this API key (public-domain translations)
+# Source: GET /v1/bibles?language=eng  — complete list as of June 2026
 _bible_id_runtime_cache: dict = {
-    "asv":    "06125adad2d5898a-01",  # American Standard Version
-    "kjv":    "de4e12af7f28f599-01",  # King James Version
-    "web":    "9879dbb7cfe39e4d-01",  # World English Bible
-    "webbe":  "7142879509583d59-01",  # WEB British Edition
-    "bsb":    "bba9f40183526463-01",  # Berean Standard Bible
-    "lsv":    "01b29f4b342acc35-01",  # Literal Standard Version
-    "wmb":    "f72b840c855f362c-04",  # World Messianic Bible
-    "dra":    "179568874c45066f-01",  # Douay-Rheims 1899
-    "rv":     "40072c4a5aba4022-01",  # Revised Version 1885
-    "t4t":    "66c22495370cdfc0-01",  # Translation for Translators
+    # Abbreviation as shown in app → bibleId
+    "asvbt":      "685d1470fe4d5c3b-01",  # American Standard Version (Byzantine Text)
+    "asv":        "06125adad2d5898a-01",  # American Standard Version
+    "bsb":        "bba9f40183526463-01",  # Berean Standard Bible
+    "englxxup":   "6bab4d6c61b31b80-01",  # Brenton English Septuagint (Updated)
+    "engbrent":   "65bfdebd704a8324-01",  # Brenton English Septuagint
+    "engkjvcpb":  "55212e3cf5d04d49-01",  # Cambridge Paragraph Bible of the KJV
+    "engdra":     "179568874c45066f-01",  # Douay-Rheims American 1899
+    "dra":        "179568874c45066f-01",  # Douay-Rheims (alias)
+    "engemtv":    "55ec700d9e0d77ea-01",  # English Majority Text Version
+    "fbv":        "65eec8e0b60e656b-01",  # Free Bible Version
+    "enggnv":     "c315fa9f71d4af3a-01",  # Geneva Bible
+    "engojps":    "bf8f1c7f3f9045a5-01",  # JPS TaNaKH 1917
+    "engkjv":     "de4e12af7f28f599-01",  # King James Version
+    "kjv":        "de4e12af7f28f599-01",  # KJV (alias)
+    "lsv":        "01b29f4b342acc35-01",  # Literal Standard Version
+    "engrv":      "40072c4a5aba4022-01",  # Revised Version 1885
+    "rv":         "40072c4a5aba4022-01",  # RV (alias)
+    "engoke":     "ec290b5045ff54a5-01",  # Targum Onkelos Etheridge
+    "engf35":     "2f0fd81d7b85b923-01",  # English NT According to Family 35
+    "tojb2011":   "c89622d31b60c444-02",  # The Orthodox Jewish Bible
+    "tcent":      "32339cf2f720ff8e-01",  # Text-Critical English NT
+    "t4t":        "66c22495370cdfc0-01",  # Translation for Translators
+    "web":        "9879dbb7cfe39e4d-01",  # World English Bible
+    "webbe":      "7142879509583d59-01",  # WEB British Edition
+    "engwebu":    "72f4e6dc683324df-01",  # World English Bible Updated
+    "engwebus":   "32664dc3288a28df-01",  # WEB American English Edition
+    "wmb":        "f72b840c855f362c-04",  # World Messianic Bible
+    "wmbbe":      "04da588535d2f823-04",  # World Messianic Bible British Edition
 }
 
 
